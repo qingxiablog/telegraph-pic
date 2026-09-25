@@ -1,0 +1,630 @@
+<?php
+if (!defined('APP_ROOT')) exit;
+
+const FORUM_OAUTH_REQUEST_TTL = 600;
+const FORUM_OAUTH_CODE_TTL = 60;
+const FORUM_OAUTH_TOKEN_TTL = 3600;
+const FORUM_OAUTH_MAX_REDIRECT_URIS = 10;
+const FORUM_OAUTH_SUPPORTED_SCOPES = ['profile', 'email'];
+
+function forum_oauth_install(array $plugin): void
+{
+    $t = app_db_types();
+    app_db_create_table('plugin_forum_oauth_clients', "id {$t['id']},client_id {$t['key']} NOT NULL UNIQUE,client_secret_hash {$t['string']} NOT NULL,name {$t['string']} NOT NULL,client_type {$t['string']} NOT NULL,redirect_uris {$t['text']} NOT NULL,allowed_scopes {$t['string']} NOT NULL,enabled INTEGER NOT NULL DEFAULT 1,created_at {$t['uint']} NOT NULL,updated_at {$t['uint']} NOT NULL");
+    app_db_create_table('plugin_forum_oauth_requests', "id {$t['id']},request_hash {$t['string']} NOT NULL UNIQUE,browser_hash {$t['string']} NOT NULL,client_id {$t['key']} NOT NULL,redirect_uri {$t['text']} NOT NULL,scope {$t['string']} NOT NULL,state {$t['text']} NOT NULL,code_challenge {$t['string']} NOT NULL,created_at {$t['uint']} NOT NULL,expires_at {$t['uint']} NOT NULL,consumed_at {$t['uint']} NOT NULL DEFAULT 0");
+    app_db_create_table('plugin_forum_oauth_codes', "id {$t['id']},code_hash {$t['string']} NOT NULL UNIQUE,client_id {$t['key']} NOT NULL,user_id {$t['uint']} NOT NULL,redirect_uri {$t['text']} NOT NULL,scope {$t['string']} NOT NULL,code_challenge {$t['string']} NOT NULL,created_at {$t['uint']} NOT NULL,expires_at {$t['uint']} NOT NULL,used_at {$t['uint']} NOT NULL DEFAULT 0");
+    app_db_create_table('plugin_forum_oauth_tokens', "id {$t['id']},token_hash {$t['string']} NOT NULL UNIQUE,client_id {$t['key']} NOT NULL,user_id {$t['uint']} NOT NULL,scope {$t['string']} NOT NULL,created_at {$t['uint']} NOT NULL,expires_at {$t['uint']} NOT NULL,revoked_at {$t['uint']} NOT NULL DEFAULT 0");
+    app_db_create_table('plugin_forum_oauth_attempts', "attempt_key {$t['key']} PRIMARY KEY,window_started_at {$t['uint']} NOT NULL,hits {$t['uint']} NOT NULL DEFAULT 0");
+    app_db_create_index('idx_forum_oauth_requests_expiry', 'plugin_forum_oauth_requests(expires_at,consumed_at)');
+    app_db_create_index('idx_forum_oauth_codes_expiry', 'plugin_forum_oauth_codes(expires_at,used_at)');
+    app_db_create_index('idx_forum_oauth_tokens_user', 'plugin_forum_oauth_tokens(user_id,revoked_at,expires_at)');
+    app_db_create_index('idx_forum_oauth_tokens_client', 'plugin_forum_oauth_tokens(client_id,revoked_at,expires_at)');
+    if (setting('forum_oauth_subject_secret') === '') {
+        save_settings_values(['forum_oauth_subject_secret' => bin2hex(random_bytes(32))]);
+    }
+}
+
+function forum_oauth_uninstall(array $plugin): void
+{
+    foreach (['attempts', 'tokens', 'codes', 'requests', 'clients'] as $table) {
+        app_db_drop_table('plugin_forum_oauth_' . $table);
+    }
+    save_settings_values(['forum_oauth_subject_secret' => '']);
+}
+
+function forum_oauth_css(): string
+{
+    return <<<'CSS'
+.forum-oauth-panel{display:grid;gap:16px}.forum-oauth-panel h2,.forum-oauth-panel h3{margin:0}.forum-oauth-note{padding:12px 14px;border:1px solid var(--line);border-radius:10px;background:var(--bg);color:var(--text-muted)}.forum-oauth-endpoints{display:grid;gap:6px;padding:12px 14px;border:1px solid var(--line-soft);border-radius:10px;background:var(--panel)}.forum-oauth-endpoints code{overflow-wrap:anywhere;word-break:break-word}.forum-oauth-actions{display:flex;flex-wrap:wrap;gap:10px;align-items:center}.forum-oauth-actions form{margin:0}.forum-oauth-client-list{display:grid;gap:12px;margin:0;padding:0;list-style:none}.forum-oauth-client{display:grid;gap:10px;padding:14px;border:1px solid var(--line);border-radius:10px;background:var(--panel)}.forum-oauth-client-head{display:flex;flex-wrap:wrap;gap:8px;justify-content:space-between;align-items:center}.forum-oauth-client-meta{display:grid;gap:5px;color:var(--text-muted);font-size:var(--font-size-sm)}.forum-oauth-client-meta code{color:var(--text);overflow-wrap:anywhere}.forum-oauth-secret-form{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr) auto;gap:8px;align-items:end}.forum-oauth-secret-form label{display:grid;gap:5px}.forum-oauth-secret-form span{font-size:var(--font-size-sm);color:var(--text-muted)}.forum-oauth-consent{display:grid;gap:16px}.forum-oauth-consent-app{padding:14px;border:1px solid var(--line);border-radius:10px;background:var(--bg)}.forum-oauth-scope-list{display:grid;gap:8px;margin:0;padding:0;list-style:none}.forum-oauth-scope-list li{padding:10px 12px;border:1px solid var(--line-soft);border-radius:8px}.forum-oauth-consent-actions{display:flex;gap:10px}.forum-oauth-consent-actions button{flex:1}.forum-oauth-deny{background:var(--panel);color:var(--danger);border:1px solid var(--danger)}@media(max-width:720px){.forum-oauth-secret-form{grid-template-columns:1fr}.forum-oauth-client-head{align-items:flex-start}.forum-oauth-consent-actions{flex-direction:column-reverse}}
+CSS;
+}
+
+function forum_oauth_random_token(int $bytes = 32): string
+{
+    return rtrim(strtr(base64_encode(random_bytes($bytes)), '+/', '-_'), '=');
+}
+
+function forum_oauth_token_hash(string $token): string
+{
+    return hash('sha256', $token);
+}
+
+function forum_oauth_json(array $data, int $status = 200): never
+{
+    http_response_code($status);
+    header('Content-Type: application/json; charset=utf-8');
+    header('Cache-Control: no-store');
+    header('Pragma: no-cache');
+    echo json_encode($data, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_INVALID_UTF8_SUBSTITUTE);
+    exit;
+}
+
+function forum_oauth_json_error(string $error, string $description, int $status = 400): never
+{
+    forum_oauth_json(['error' => $error, 'error_description' => $description], $status);
+}
+
+function forum_oauth_external_redirect(string $url): never
+{
+    header('Cache-Control: no-store');
+    header('Location: ' . $url, true, 302);
+    exit;
+}
+
+function forum_oauth_secure_transport(): bool
+{
+    $parts = parse_url(base_url());
+    $scheme = strtolower((string)($parts['scheme'] ?? ''));
+    $host = strtolower(trim((string)($parts['host'] ?? ''), '[]'));
+    return $scheme === 'https' || ($scheme === 'http' && in_array($host, ['localhost', '127.0.0.1', '::1'], true));
+}
+
+function forum_oauth_redirect_uri(string $uri): ?string
+{
+    $uri = trim($uri);
+    if ($uri === '' || strlen($uri) > 2048 || preg_match('/[\x00-\x1F\x7F]/', $uri)) return null;
+    $parts = parse_url($uri);
+    if (!is_array($parts) || isset($parts['user']) || isset($parts['pass']) || isset($parts['fragment'])) return null;
+    $scheme = strtolower((string)($parts['scheme'] ?? ''));
+    $host = strtolower(trim((string)($parts['host'] ?? ''), '[]'));
+    if ($host === '' || !in_array($scheme, ['http', 'https'], true)) return null;
+    if ($scheme !== 'https' && !in_array($host, ['localhost', '127.0.0.1', '::1'], true)) return null;
+    return $uri;
+}
+
+function forum_oauth_decode_list(string $json): array
+{
+    $items = json_decode($json, true);
+    if (!is_array($items)) return [];
+    return array_values(array_filter(array_map('strval', $items), static fn(string $item): bool => $item !== ''));
+}
+
+function forum_oauth_scope_list(string $scope): array
+{
+    $items = preg_split('/\s+/', trim($scope), -1, PREG_SPLIT_NO_EMPTY) ?: [];
+    return array_values(array_unique(array_map('strval', $items)));
+}
+
+function forum_oauth_scope_string(array $scopes): string
+{
+    return implode(' ', array_values(array_unique(array_map('strval', $scopes))));
+}
+
+function forum_oauth_client(string $client_id): ?array
+{
+    if ($client_id === '' || strlen($client_id) > 191) return null;
+    return one("SELECT * FROM plugin_forum_oauth_clients WHERE client_id=?", [$client_id]);
+}
+
+function forum_oauth_client_redirect_allowed(array $client, string $redirect_uri): bool
+{
+    return in_array($redirect_uri, forum_oauth_decode_list((string)$client['redirect_uris']), true);
+}
+
+function forum_oauth_request_cookie_name(string $request_token): string
+{
+    return 'forum_oauth_tx_' . substr($request_token, 0, 16);
+}
+
+function forum_oauth_valid_flow_token(string $token): bool
+{
+    return strlen($token) === 43 && preg_match('/^[A-Za-z0-9_-]+$/D', $token) === 1;
+}
+
+function forum_oauth_load_request(string $request_token): ?array
+{
+    if (!forum_oauth_valid_flow_token($request_token)) return null;
+    $request = one("SELECT * FROM plugin_forum_oauth_requests WHERE request_hash=?", [forum_oauth_token_hash($request_token)]);
+    if (!$request || (int)$request['consumed_at'] !== 0 || (int)$request['expires_at'] < now()) return null;
+    $browser_token = (string)($_COOKIE[forum_oauth_request_cookie_name($request_token)] ?? '');
+    if ($browser_token === '' || !hash_equals((string)$request['browser_hash'], forum_oauth_token_hash($browser_token))) return null;
+    return $request;
+}
+
+function forum_oauth_clear_request_cookie(string $request_token): void
+{
+    $name = forum_oauth_request_cookie_name($request_token);
+    app_cookie($name, '', time() - 3600);
+    unset($_COOKIE[$name]);
+}
+
+function forum_oauth_redirect_error(string $redirect_uri, string $state, string $error, string $description): never
+{
+    $params = ['error' => $error, 'error_description' => $description];
+    if ($state !== '') $params['state'] = $state;
+    forum_oauth_external_redirect(append_url_query($redirect_uri, $params));
+}
+
+function forum_oauth_rate_key(string $bucket): string
+{
+    return hash('sha256', $bucket . '|' . ip_addr());
+}
+
+function forum_oauth_rate_allowed(string $bucket, int $limit = 30, int $window = 300): bool
+{
+    $row = one("SELECT window_started_at,hits FROM plugin_forum_oauth_attempts WHERE attempt_key=?", [forum_oauth_rate_key($bucket)]);
+    if (!$row || now() - (int)$row['window_started_at'] >= $window) return true;
+    return (int)$row['hits'] < $limit;
+}
+
+function forum_oauth_rate_hit(string $bucket, int $window = 300): void
+{
+    $key = forum_oauth_rate_key($bucket);
+    tx(function () use ($key, $window): void {
+        $row = one("SELECT window_started_at,hits FROM plugin_forum_oauth_attempts WHERE attempt_key=?", [$key]);
+        if (!$row || now() - (int)$row['window_started_at'] >= $window) {
+            app_db_upsert('plugin_forum_oauth_attempts', ['attempt_key' => $key, 'window_started_at' => now(), 'hits' => 1], ['attempt_key']);
+            return;
+        }
+        q("UPDATE plugin_forum_oauth_attempts SET hits=hits+1 WHERE attempt_key=?", [$key]);
+    });
+}
+
+function forum_oauth_request_csrf_exempt(mixed $value, array $ctx): mixed
+{
+    $action = (string)($ctx['action'] ?? '');
+    if (is_post_request() && in_array($action, ['forum_oauth_token', 'forum_oauth_revoke'], true)) return true;
+    return $value;
+}
+
+function forum_oauth_site_closed_allow(mixed $value, array $ctx): mixed
+{
+    $action = (string)($ctx['action'] ?? '');
+    if (in_array($action, ['forum_oauth_token', 'forum_oauth_userinfo', 'forum_oauth_revoke'], true)) return true;
+    return $value;
+}
+
+function forum_oauth_admin_tabs(mixed $value, array $ctx): mixed
+{
+    if (!is_array($value)) return $value;
+    $value['forum_oauth'] = ['label' => '身份授权', 'href' => admin_url(['tab' => 'forum_oauth'])];
+    return $value;
+}
+
+function forum_oauth_user_after_save(mixed $value, array $ctx): mixed
+{
+    $user_id = max(0, (int)($ctx['id'] ?? 0));
+    if ($user_id > 0) q("UPDATE plugin_forum_oauth_tokens SET revoked_at=? WHERE user_id=? AND revoked_at=0", [now(), $user_id]);
+    return $value;
+}
+
+function forum_oauth_content_before_delete(mixed $value, array $ctx): mixed
+{
+    if ((string)($ctx['table'] ?? '') !== 'users' || !is_array($ctx['row'] ?? null)) return $value;
+    $user_id = max(0, (int)$ctx['row']['id']);
+    if ($user_id > 0) {
+        q("DELETE FROM plugin_forum_oauth_codes WHERE user_id=?", [$user_id]);
+        q("DELETE FROM plugin_forum_oauth_tokens WHERE user_id=?", [$user_id]);
+    }
+    return $value;
+}
+
+function forum_oauth_authorize_route(array $plugin): void
+{
+    if (!forum_oauth_secure_transport()) err('身份授权只允许在 HTTPS 或本机开发地址使用', 400);
+    $request_token = trim((string)($_GET['request'] ?? $_POST['request'] ?? ''));
+    if ($request_token === '') {
+        if (is_post_request()) err('授权请求无效', 400);
+        forum_oauth_authorize_start();
+        return;
+    }
+    $request = forum_oauth_load_request($request_token);
+    if (!$request) err('授权请求已失效，请返回第三方应用重新登录', 400);
+    $client = forum_oauth_client((string)$request['client_id']);
+    if (!$client || (int)$client['enabled'] !== 1 || !forum_oauth_client_redirect_allowed($client, (string)$request['redirect_uri'])) {
+        err('第三方应用已停用或配置发生变化', 400);
+    }
+    if (!uid()) {
+        $return_url = route_url('forum_oauth_authorize', ['request' => $request_token]);
+        app_cookie('__auth_return_url', $return_url, time() + FORUM_OAUTH_REQUEST_TTL);
+        go(route_url('login'));
+    }
+    if (is_post_request()) {
+        forum_oauth_authorize_submit($request_token, $request, $client);
+        return;
+    }
+    forum_oauth_consent_page($request_token, $request, $client);
+}
+
+function forum_oauth_authorize_start(): void
+{
+    $client_id = trim((string)($_GET['client_id'] ?? ''));
+    $redirect_uri = forum_oauth_redirect_uri((string)($_GET['redirect_uri'] ?? ''));
+    $client = forum_oauth_client($client_id);
+    if (!$client || (int)$client['enabled'] !== 1 || $redirect_uri === null || !forum_oauth_client_redirect_allowed($client, $redirect_uri)) {
+        err('第三方应用或回调地址无效', 400);
+    }
+    $state = (string)($_GET['state'] ?? '');
+    $response_type = (string)($_GET['response_type'] ?? '');
+    $method = (string)($_GET['code_challenge_method'] ?? '');
+    $challenge = trim((string)($_GET['code_challenge'] ?? ''));
+    if ($state === '' || strlen($state) > 512 || preg_match('/[\x00-\x1F\x7F]/', $state)) forum_oauth_redirect_error($redirect_uri, '', 'invalid_request', 'state 无效');
+    if ($response_type !== 'code') forum_oauth_redirect_error($redirect_uri, $state, 'unsupported_response_type', '仅支持授权码模式');
+    if ($method !== 'S256' || strlen($challenge) !== 43 || preg_match('/^[A-Za-z0-9_-]+$/D', $challenge) !== 1) {
+        forum_oauth_redirect_error($redirect_uri, $state, 'invalid_request', '必须使用 PKCE S256');
+    }
+    $requested_scopes = forum_oauth_scope_list((string)($_GET['scope'] ?? 'profile'));
+    if (!$requested_scopes) $requested_scopes = ['profile'];
+    $allowed_scopes = forum_oauth_scope_list((string)$client['allowed_scopes']);
+    if (array_diff($requested_scopes, FORUM_OAUTH_SUPPORTED_SCOPES) || array_diff($requested_scopes, $allowed_scopes)) {
+        forum_oauth_redirect_error($redirect_uri, $state, 'invalid_scope', '请求了未授权的权限');
+    }
+    $rate_bucket = 'authorize:' . $client_id;
+    if (!forum_oauth_rate_allowed($rate_bucket, 60, 300)) forum_oauth_redirect_error($redirect_uri, $state, 'temporarily_unavailable', '授权请求过于频繁');
+    forum_oauth_rate_hit($rate_bucket, 300);
+    $request_token = forum_oauth_random_token();
+    $browser_token = forum_oauth_random_token();
+    q("INSERT INTO plugin_forum_oauth_requests(request_hash,browser_hash,client_id,redirect_uri,scope,state,code_challenge,created_at,expires_at,consumed_at) VALUES(?,?,?,?,?,?,?,?,?,0)", [
+        forum_oauth_token_hash($request_token),
+        forum_oauth_token_hash($browser_token),
+        $client_id,
+        $redirect_uri,
+        forum_oauth_scope_string($requested_scopes),
+        $state,
+        $challenge,
+        now(),
+        now() + FORUM_OAUTH_REQUEST_TTL,
+    ]);
+    $cookie_name = forum_oauth_request_cookie_name($request_token);
+    app_cookie($cookie_name, $browser_token, time() + FORUM_OAUTH_REQUEST_TTL);
+    $_COOKIE[$cookie_name] = $browser_token;
+    if (!uid()) {
+        app_cookie('__auth_return_url', route_url('forum_oauth_authorize', ['request' => $request_token]), time() + FORUM_OAUTH_REQUEST_TTL);
+        go(route_url('login'));
+    }
+    forum_oauth_consent_page($request_token, forum_oauth_load_request($request_token) ?: err('授权请求创建失败'), $client);
+}
+
+function forum_oauth_authorize_submit(string $request_token, array $request, array $client): void
+{
+    require_post();
+    $decision = (string)($_POST['decision'] ?? '');
+    if (!in_array($decision, ['approve', 'deny'], true)) err('请选择允许或拒绝');
+    $code = tx(function () use ($decision, $request): string|false|null {
+        $updated = q("UPDATE plugin_forum_oauth_requests SET consumed_at=? WHERE request_hash=? AND consumed_at=0 AND expires_at>=?", [now(), (string)$request['request_hash'], now()]);
+        if ($updated->rowCount() !== 1) return null;
+        if ($decision === 'deny') return false;
+        $raw = forum_oauth_random_token();
+        q("INSERT INTO plugin_forum_oauth_codes(code_hash,client_id,user_id,redirect_uri,scope,code_challenge,created_at,expires_at,used_at) VALUES(?,?,?,?,?,?,?,?,0)", [
+            forum_oauth_token_hash($raw),
+            (string)$request['client_id'],
+            uid(),
+            (string)$request['redirect_uri'],
+            (string)$request['scope'],
+            (string)$request['code_challenge'],
+            now(),
+            now() + FORUM_OAUTH_CODE_TTL,
+        ]);
+        return $raw;
+    });
+    if ($code === null) err('授权请求已被处理，请返回第三方应用重试', 400);
+    forum_oauth_clear_request_cookie($request_token);
+    if ($code === false) forum_oauth_redirect_error((string)$request['redirect_uri'], (string)$request['state'], 'access_denied', '用户拒绝了授权');
+    forum_oauth_external_redirect(append_url_query((string)$request['redirect_uri'], ['code' => $code, 'state' => (string)$request['state']]));
+}
+
+function forum_oauth_consent_page(string $request_token, array $request, array $client): void
+{
+    $scope_labels = ['profile' => '读取你的稳定用户标识和用户名', 'email' => '读取你的邮箱地址'];
+    $scope_html = '';
+    foreach (forum_oauth_scope_list((string)$request['scope']) as $scope) {
+        $scope_html .= '<li><strong>' . h($scope) . '</strong><div>' . h($scope_labels[$scope] ?? $scope) . '</div></li>';
+    }
+    $redirect_host = (string)(parse_url((string)$request['redirect_uri'], PHP_URL_HOST) ?: '');
+    $body = '<div class="form-panel forum-oauth-panel forum-oauth-consent"><h2>授权登录</h2><div class="forum-oauth-consent-app"><strong>' . h((string)$client['name']) . '</strong><div>将使用你的论坛账号登录</div><small>回调域名：' . h($redirect_host) . '</small></div><div><h3>该应用将获得</h3><ul class="forum-oauth-scope-list">' . $scope_html . '</ul></div><div class="forum-oauth-note">论坛不会把你的密码或登录 Cookie 交给第三方应用。</div><form method="post" action="' . h(route_url('forum_oauth_authorize', ['request' => $request_token])) . '" data-no-ajax="true" onsubmit="event.stopImmediatePropagation(); const input=document.createElement(\'input\'); input.type=\'hidden\'; input.name=\'decision\'; input.value=event.submitter ? event.submitter.value : \'approve\'; this.appendChild(input); this.submit(); return false;">' . form_token() . '<input type="hidden" name="request" value="' . h($request_token) . '"><div class="forum-oauth-consent-actions"><button class="forum-oauth-deny" type="submit" name="decision" value="deny">拒绝</button><button type="submit" name="decision" value="approve">允许并继续</button></div></form></div>';
+    page('授权登录', form_shell($body, me()));
+}
+
+function forum_oauth_authorization_header(): string
+{
+    foreach (['HTTP_AUTHORIZATION', 'REDIRECT_HTTP_AUTHORIZATION'] as $key) {
+        $value = trim((string)($_SERVER[$key] ?? ''));
+        if ($value !== '') return $value;
+    }
+    return '';
+}
+
+function forum_oauth_client_credentials(): array
+{
+    $client_id = trim((string)($_POST['client_id'] ?? ''));
+    $client_secret = (string)($_POST['client_secret'] ?? '');
+    $header = forum_oauth_authorization_header();
+    if (str_starts_with(strtolower($header), 'basic ')) {
+        $decoded = base64_decode(trim(substr($header, 6)), true);
+        if (is_string($decoded) && str_contains($decoded, ':')) {
+            [$basic_id, $basic_secret] = explode(':', $decoded, 2);
+            $client_id = rawurldecode($basic_id);
+            $client_secret = rawurldecode($basic_secret);
+        }
+    }
+    return [$client_id, $client_secret];
+}
+
+function forum_oauth_authenticate_client(): array
+{
+    [$client_id, $client_secret] = forum_oauth_client_credentials();
+    $bucket = 'client:' . $client_id;
+    if (!forum_oauth_rate_allowed($bucket)) forum_oauth_json_error('temporarily_unavailable', '请求过于频繁', 429);
+    $client = forum_oauth_client($client_id);
+    $valid = $client && (int)$client['enabled'] === 1;
+    if ($valid && (string)$client['client_type'] === 'confidential') {
+        $valid = $client_secret !== '' && password_verify($client_secret, (string)$client['client_secret_hash']);
+    }
+    if (!$valid) {
+        forum_oauth_rate_hit($bucket);
+        header('WWW-Authenticate: Basic realm="forum_oauth"');
+        forum_oauth_json_error('invalid_client', '客户端认证失败', 401);
+    }
+    return $client;
+}
+
+function forum_oauth_token_route(array $plugin): void
+{
+    if (!is_post_request()) forum_oauth_json_error('invalid_request', '仅接受 POST 请求', 405);
+    if (!forum_oauth_secure_transport()) forum_oauth_json_error('invalid_request', 'Token 接口要求 HTTPS', 400);
+    if ((string)($_POST['grant_type'] ?? '') !== 'authorization_code') {
+        forum_oauth_json_error('unsupported_grant_type', '仅支持 authorization_code');
+    }
+    $client = forum_oauth_authenticate_client();
+    $code = trim((string)($_POST['code'] ?? ''));
+    $redirect_uri = (string)($_POST['redirect_uri'] ?? '');
+    $verifier = trim((string)($_POST['code_verifier'] ?? ''));
+    if (!forum_oauth_valid_flow_token($code) || strlen($verifier) < 43 || strlen($verifier) > 128 || preg_match('/^[A-Za-z0-9._~-]+$/D', $verifier) !== 1) {
+        forum_oauth_rate_hit('client:' . (string)$client['client_id']);
+        forum_oauth_json_error('invalid_grant', '授权码或 PKCE 校验参数无效');
+    }
+    $row = one("SELECT * FROM plugin_forum_oauth_codes WHERE code_hash=?", [forum_oauth_token_hash($code)]);
+    $expected_challenge = rtrim(strtr(base64_encode(hash('sha256', $verifier, true)), '+/', '-_'), '=');
+    $valid = $row
+        && (int)$row['used_at'] === 0
+        && (int)$row['expires_at'] >= now()
+        && hash_equals((string)$row['client_id'], (string)$client['client_id'])
+        && hash_equals((string)$row['redirect_uri'], $redirect_uri)
+        && hash_equals((string)$row['code_challenge'], $expected_challenge);
+    if (!$valid) {
+        forum_oauth_rate_hit('client:' . (string)$client['client_id']);
+        forum_oauth_json_error('invalid_grant', '授权码无效、已过期或已使用');
+    }
+    $token = tx(function () use ($row): ?string {
+        $updated = q("UPDATE plugin_forum_oauth_codes SET used_at=? WHERE code_hash=? AND used_at=0 AND expires_at>=?", [now(), (string)$row['code_hash'], now()]);
+        if ($updated->rowCount() !== 1) return null;
+        $raw = forum_oauth_random_token();
+        q("INSERT INTO plugin_forum_oauth_tokens(token_hash,client_id,user_id,scope,created_at,expires_at,revoked_at) VALUES(?,?,?,?,?,?,0)", [
+            forum_oauth_token_hash($raw),
+            (string)$row['client_id'],
+            (int)$row['user_id'],
+            (string)$row['scope'],
+            now(),
+            now() + FORUM_OAUTH_TOKEN_TTL,
+        ]);
+        return $raw;
+    });
+    if ($token === null) forum_oauth_json_error('invalid_grant', '授权码已被使用');
+    forum_oauth_json([
+        'access_token' => $token,
+        'token_type' => 'Bearer',
+        'expires_in' => FORUM_OAUTH_TOKEN_TTL,
+        'scope' => (string)$row['scope'],
+    ]);
+}
+
+function forum_oauth_bearer_token(): string
+{
+    $header = forum_oauth_authorization_header();
+    if (preg_match('/^Bearer\s+([A-Za-z0-9._~-]+)$/iD', $header, $match) !== 1) return '';
+    return (string)$match[1];
+}
+
+function forum_oauth_userinfo_route(array $plugin): void
+{
+    if (($_SERVER['REQUEST_METHOD'] ?? 'GET') !== 'GET') forum_oauth_json_error('invalid_request', '仅接受 GET 请求', 405);
+    if (!forum_oauth_secure_transport()) forum_oauth_json_error('invalid_request', 'UserInfo 接口要求 HTTPS', 400);
+    $token = forum_oauth_bearer_token();
+    if (!forum_oauth_valid_flow_token($token)) {
+        header('WWW-Authenticate: Bearer realm="forum_oauth"');
+        forum_oauth_json_error('invalid_token', '访问令牌无效', 401);
+    }
+    $row = one("SELECT t.client_id,t.user_id,t.scope,t.expires_at,t.revoked_at,u.username,u.email,u.is_banned,c.enabled AS client_enabled FROM plugin_forum_oauth_tokens t JOIN app_users u ON u.id=t.user_id JOIN plugin_forum_oauth_clients c ON c.client_id=t.client_id WHERE t.token_hash=?", [forum_oauth_token_hash($token)]);
+    if (!$row || (int)$row['revoked_at'] !== 0 || (int)$row['expires_at'] < now() || (int)$row['is_banned'] === 1 || (int)$row['client_enabled'] !== 1) {
+        header('WWW-Authenticate: Bearer realm="forum_oauth", error="invalid_token"');
+        forum_oauth_json_error('invalid_token', '访问令牌已过期或已撤销', 401);
+    }
+    $secret = setting('forum_oauth_subject_secret');
+    if ($secret === '') forum_oauth_json_error('server_error', '身份授权配置不完整', 500);
+    $scopes = forum_oauth_scope_list((string)$row['scope']);
+    $data = [
+        'sub' => hash_hmac('sha256', (string)$row['client_id'] . '|' . (int)$row['user_id'], $secret),
+    ];
+    if (in_array('profile', $scopes, true)) {
+        $data['preferred_username'] = (string)$row['username'];
+        $data['name'] = (string)$row['username'];
+    }
+    if (in_array('email', $scopes, true)) $data['email'] = (string)$row['email'];
+    forum_oauth_json($data);
+}
+
+function forum_oauth_revoke_route(array $plugin): void
+{
+    if (!is_post_request()) forum_oauth_json_error('invalid_request', '仅接受 POST 请求', 405);
+    if (!forum_oauth_secure_transport()) forum_oauth_json_error('invalid_request', '撤销接口要求 HTTPS', 400);
+    $client = forum_oauth_authenticate_client();
+    $token = trim((string)($_POST['token'] ?? ''));
+    if ($token !== '') {
+        q("UPDATE plugin_forum_oauth_tokens SET revoked_at=? WHERE token_hash=? AND client_id=? AND revoked_at=0", [now(), forum_oauth_token_hash($token), (string)$client['client_id']]);
+    }
+    forum_oauth_json([]);
+}
+
+function forum_oauth_admin_parse_redirects(string $text): array
+{
+    $lines = preg_split('/\R+/', trim($text), -1, PREG_SPLIT_NO_EMPTY) ?: [];
+    $redirects = [];
+    foreach ($lines as $line) {
+        $uri = forum_oauth_redirect_uri(trim((string)$line));
+        if ($uri === null) err('回调地址无效；正式环境必须使用 HTTPS，本机可使用 localhost');
+        $redirects[$uri] = true;
+    }
+    $redirects = array_keys($redirects);
+    if (!$redirects || count($redirects) > FORUM_OAUTH_MAX_REDIRECT_URIS) err('请填写 1 至 ' . FORUM_OAUTH_MAX_REDIRECT_URIS . ' 个回调地址');
+    return $redirects;
+}
+
+function forum_oauth_admin_secret(string $secret, string $confirm): string
+{
+    if ($secret === '' || strlen($secret) < 32 || strlen($secret) > 200) err('客户端密钥长度必须为 32 至 200 个字符');
+    if (!hash_equals($secret, $confirm)) err('两次输入的客户端密钥不一致');
+    return password_hash($secret, PASSWORD_DEFAULT);
+}
+
+function forum_oauth_admin_create_client(): void
+{
+    $name = post('client_name', 80);
+    if ($name === '') err('应用名称不能为空');
+    $type = (string)($_POST['client_type'] ?? 'confidential');
+    if (!in_array($type, ['confidential', 'public'], true)) err('客户端类型无效');
+    $redirects = forum_oauth_admin_parse_redirects((string)($_POST['redirect_uris'] ?? ''));
+    $scopes = ['profile'];
+    if (isset($_POST['scope_email'])) $scopes[] = 'email';
+    $secret_hash = $type === 'confidential'
+        ? forum_oauth_admin_secret((string)($_POST['client_secret'] ?? ''), (string)($_POST['client_secret_confirm'] ?? ''))
+        : '';
+    $client_id = 'foa_' . forum_oauth_random_token(18);
+    q("INSERT INTO plugin_forum_oauth_clients(client_id,client_secret_hash,name,client_type,redirect_uris,allowed_scopes,enabled,created_at,updated_at) VALUES(?,?,?,?,?,?,1,?,?)", [
+        $client_id,
+        $secret_hash,
+        $name,
+        $type,
+        json_encode($redirects, JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR),
+        forum_oauth_scope_string($scopes),
+        now(),
+        now(),
+    ]);
+    set_flash('应用已创建，Client ID：' . $client_id);
+    go(admin_url(['tab' => 'forum_oauth']));
+}
+
+function forum_oauth_admin_client_action(string $action): void
+{
+    $client_id = trim((string)($_POST['client_id'] ?? ''));
+    $client = forum_oauth_client($client_id) ?: err('应用不存在');
+    if ($action === 'toggle') {
+        $enabled = (int)$client['enabled'] === 1 ? 0 : 1;
+        q("UPDATE plugin_forum_oauth_clients SET enabled=?,updated_at=? WHERE client_id=?", [$enabled, now(), $client_id]);
+        if (!$enabled) q("UPDATE plugin_forum_oauth_tokens SET revoked_at=? WHERE client_id=? AND revoked_at=0", [now(), $client_id]);
+        set_flash($enabled ? '应用已启用' : '应用已停用，现有令牌已撤销');
+    } elseif ($action === 'revoke') {
+        q("UPDATE plugin_forum_oauth_tokens SET revoked_at=? WHERE client_id=? AND revoked_at=0", [now(), $client_id]);
+        set_flash('该应用的令牌已全部撤销');
+    } elseif ($action === 'rotate') {
+        if ((string)$client['client_type'] !== 'confidential') err('公开客户端没有客户端密钥');
+        $hash = forum_oauth_admin_secret((string)($_POST['new_client_secret'] ?? ''), (string)($_POST['new_client_secret_confirm'] ?? ''));
+        tx(function () use ($hash, $client_id): void {
+            q("UPDATE plugin_forum_oauth_clients SET client_secret_hash=?,updated_at=? WHERE client_id=?", [$hash, now(), $client_id]);
+            q("UPDATE plugin_forum_oauth_tokens SET revoked_at=? WHERE client_id=? AND revoked_at=0", [now(), $client_id]);
+        });
+        set_flash('客户端密钥已更新，现有令牌已撤销');
+    } elseif ($action === 'delete') {
+        tx(function () use ($client_id): void {
+            foreach (['requests', 'codes', 'tokens'] as $table) q('DELETE FROM plugin_forum_oauth_' . $table . ' WHERE client_id=?', [$client_id]);
+            q("DELETE FROM plugin_forum_oauth_clients WHERE client_id=?", [$client_id]);
+        });
+        set_flash('应用及其授权数据已删除');
+    } else err('操作无效');
+    go(admin_url(['tab' => 'forum_oauth']));
+}
+
+function forum_oauth_admin_page(array $plugin): string
+{
+    need_admin();
+    if (is_post_request()) {
+        require_post();
+        $action = (string)($_POST['forum_oauth_action'] ?? '');
+        if ($action === 'create') forum_oauth_admin_create_client();
+        forum_oauth_admin_client_action($action);
+    }
+    $endpoint_html = '<div class="forum-oauth-endpoints"><strong>接口地址</strong><code>' . h(absolute_url(route_url('forum_oauth_authorize'))) . '</code><code>' . h(absolute_url(route_url('forum_oauth_token'))) . '</code><code>' . h(absolute_url(route_url('forum_oauth_userinfo'))) . '</code><code>' . h(absolute_url(route_url('forum_oauth_revoke'))) . '</code></div>';
+    $warning = forum_oauth_secure_transport() ? '' : '<div class="forum-oauth-note">当前站点地址不是 HTTPS。除 localhost 外，授权接口会拒绝工作。</div>';
+    $create = '<div class="form-panel forum-oauth-panel"><h2>新增第三方应用</h2><form method="post">' . form_token() . '<input type="hidden" name="forum_oauth_action" value="create">' . input('应用名称', 'client_name', '', 'text', true) . '<label class="grid"><span>客户端类型<small>服务端应用选保密客户端；纯前端或本机应用选公开客户端。</small></span><select name="client_type"><option value="confidential">保密客户端</option><option value="public">公开客户端</option></select></label>' . textarea('回调地址', 'redirect_uris', '', true, '每行一个；正式环境使用 HTTPS，本机可使用 http://localhost。') . input('客户端密钥', 'client_secret', '', 'password', false, '保密客户端必填，长度至少 32；插件不会保存明文。') . input('确认客户端密钥', 'client_secret_confirm', '', 'password') . checkbox('允许读取邮箱', 'scope_email', false) . '<button type="submit">创建应用</button></form></div>';
+    $rows = q("SELECT * FROM plugin_forum_oauth_clients ORDER BY created_at DESC,id DESC")->fetchAll();
+    $list = '<div class="form-panel forum-oauth-panel"><h2>已登记应用</h2><ul class="forum-oauth-client-list">';
+    foreach ($rows as $row) {
+        $client_id = (string)$row['client_id'];
+        $redirects = forum_oauth_decode_list((string)$row['redirect_uris']);
+        $status = (int)$row['enabled'] === 1 ? '已启用' : '已停用';
+        $actions = post_action_form(admin_url(['tab' => 'forum_oauth']), (int)$row['enabled'] === 1 ? '停用' : '启用', ['forum_oauth_action' => 'toggle', 'client_id' => $client_id]);
+        $actions .= post_action_form(admin_url(['tab' => 'forum_oauth']), '撤销令牌', ['forum_oauth_action' => 'revoke', 'client_id' => $client_id], '', '确定撤销该应用的全部访问令牌？');
+        $actions .= post_action_form(admin_url(['tab' => 'forum_oauth']), '删除', ['forum_oauth_action' => 'delete', 'client_id' => $client_id], 'danger', '确定删除应用及全部授权数据？');
+        $rotate = '';
+        if ((string)$row['client_type'] === 'confidential') {
+            $rotate = '<form class="forum-oauth-secret-form" method="post">' . form_token() . '<input type="hidden" name="forum_oauth_action" value="rotate"><input type="hidden" name="client_id" value="' . h($client_id) . '"><label><span>新客户端密钥</span><input type="password" name="new_client_secret" minlength="32" required></label><label><span>确认新密钥</span><input type="password" name="new_client_secret_confirm" minlength="32" required></label><button type="submit">更新密钥</button></form>';
+        }
+        $redirect_html = implode('<br>', array_map('h', $redirects));
+        $list .= '<li class="forum-oauth-client"><div class="forum-oauth-client-head"><div><strong>' . h((string)$row['name']) . '</strong> <span class="admin-flag' . ((int)$row['enabled'] === 1 ? ' on' : '') . '">' . h($status) . '</span></div><code>' . h($client_id) . '</code></div><div class="forum-oauth-client-meta"><div>类型：' . h((string)$row['client_type']) . '</div><div>权限：' . h((string)$row['allowed_scopes']) . '</div><div>回调：' . $redirect_html . '</div></div><div class="forum-oauth-actions">' . $actions . '</div>' . $rotate . '</li>';
+    }
+    if (!$rows) $list .= '<li class="forum-oauth-note">尚未登记第三方应用。</li>';
+    $list .= '</ul></div>';
+    return '<div class="forum-oauth-panel"><div class="form-panel forum-oauth-panel"><h2>论坛身份授权</h2><p>第三方应用通过授权码 + PKCE 获取论坛身份。客户端密钥由管理员设置，插件只保存密码哈希。</p>' . $warning . $endpoint_html . '</div>' . $create . $list . '</div>';
+}
+
+function forum_oauth_cleanup(array $plugin = [], array $task = []): string
+{
+    $now = now();
+    $request_cutoff = $now - 86400;
+    $token_cutoff = $now - 604800;
+    $attempt_cutoff = $now - 3600;
+    $counts = [];
+    $counts[] = q("DELETE FROM plugin_forum_oauth_requests WHERE expires_at<? OR (consumed_at>0 AND consumed_at<?)", [$now, $request_cutoff])->rowCount();
+    $counts[] = q("DELETE FROM plugin_forum_oauth_codes WHERE expires_at<? OR (used_at>0 AND used_at<?)", [$now, $request_cutoff])->rowCount();
+    $counts[] = q("DELETE FROM plugin_forum_oauth_tokens WHERE expires_at<? OR (revoked_at>0 AND revoked_at<?)", [$now, $token_cutoff])->rowCount();
+    $counts[] = q("DELETE FROM plugin_forum_oauth_attempts WHERE window_started_at<?", [$attempt_cutoff])->rowCount();
+    return '清理 ' . array_sum($counts) . ' 条过期授权数据';
+}
+
+return [
+    'id' => 'forum_oauth',
+    'name' => '论坛身份授权',
+    'version' => '1.0.0',
+    'description' => '允许第三方应用使用论坛账号安全登录。',
+    'author' => 'bbs1org',
+    'assets' => ['css' => 'forum_oauth_css'],
+    'hooks' => [
+        'request.csrf_exempt' => 'forum_oauth_request_csrf_exempt',
+        'site.closed_allow' => 'forum_oauth_site_closed_allow',
+        'admin.tabs' => 'forum_oauth_admin_tabs',
+        'user.after_save' => 'forum_oauth_user_after_save',
+        'content.before_delete' => 'forum_oauth_content_before_delete',
+    ],
+    'routes' => [
+        'forum_oauth_authorize' => 'forum_oauth_authorize_route',
+        'forum_oauth_token' => 'forum_oauth_token_route',
+        'forum_oauth_userinfo' => 'forum_oauth_userinfo_route',
+        'forum_oauth_revoke' => 'forum_oauth_revoke_route',
+    ],
+    'admin_tabs' => ['forum_oauth' => 'forum_oauth_admin_page'],
+    'entries' => ['admin_tabs' => true],
+    'cron' => [
+        'cleanup' => ['callback' => 'forum_oauth_cleanup', 'interval' => 600],
+    ],
+    'install' => 'forum_oauth_install',
+    'uninstall' => 'forum_oauth_uninstall',
+];
