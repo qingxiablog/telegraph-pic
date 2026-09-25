@@ -1,4 +1,4 @@
-_workers-new.js为基于原版改造成 bbs1.org 论坛forum_oauth插件（https://bbs1.org/topic/858）授权登录的版本
+_workers-new.js为基于原版改造成 bbs1.org 论坛forum_oauth插件（ https://bbs1.org/topic/858 ）授权登录的版本
 
 
 
