@@ -7,6 +7,30 @@ CREATE TABLE IF NOT EXISTS media (
   fileId TEXT NOT NULL
 );
 ```
+## 绑定变量：
+```
+FORUM_OAUTH_ENABLED=true
+DOMAIN=你workers绑定的域名
+ADMIN_PATH=管理后台的目录，比如admin 那管理后台的地址就是 https://你workers绑定的域名/admin
+ENABLE_AUTH=true
+USERNAME=后台管理员用户名
+MAX_SIZE_MB=限制文件大小（例如：5 代表5MB）
+TG_CHAT_ID=-1004355744660 （私密频道数字ID，获取后在前面加-100拼接出来的就是TG_CHAT_ID，比如数字ID是12345678，那拼接出来就是-10012345678）
+
+FORUM_OAUTH_AUTHORIZE_URL=https://你bbs1论坛的域名/forum_oauth_authorize
+FORUM_OAUTH_TOKEN_URL=https://你bbs1论坛的域名/forum_oauth_token
+FORUM_OAUTH_USERINFO_URL=https://你bbs1论坛的域名/forum_oauth_userinfo
+FORUM_OAUTH_REVOKE_URL=https://你bbs1论坛的域名/forum_oauth_revoke
+FORUM_OAUTH_CLIENT_ID=foa_你的ClientID （添加完应用就会显示）
+FORUM_OAUTH_REDIRECT_URI=https://你workers绑定的域名/auth/callback
+
+以下这些变量添加时建议勾选密钥：
+
+TG_BOT_TOKEN=你的Telegram机器人Token
+PASSWORD=你的后台密码
+FORUM_OAUTH_CLIENT_SECRET=论坛客户端密钥
+FORUM_OAUTH_SESSION_SECRET=随机32位以上字符串
+```
 
 
 # Telegraph图床
