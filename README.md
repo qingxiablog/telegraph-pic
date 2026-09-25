@@ -1,3 +1,7 @@
+_workers-new.js为基于原版改造成 bbs1.org 论坛forum_oauth插件（https://bbs1.org/topic/858）授权登录的版本
+
+
+
 # Telegraph图床
 
 基于 Cloudflare Worker 和 Telegram Bot API 的图床 / 视频床 / 文件床服务
